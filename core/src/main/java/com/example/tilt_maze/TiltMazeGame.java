@@ -9,150 +9,139 @@ import com.badlogic.gdx.graphics.OrthographicCamera;
 import com.badlogic.gdx.graphics.g2d.BitmapFont;
 import com.badlogic.gdx.graphics.g2d.SpriteBatch;
 import com.badlogic.gdx.graphics.glutils.ShapeRenderer;
-import com.badlogic.gdx.math.Circle;
 import com.badlogic.gdx.math.MathUtils;
 import com.badlogic.gdx.math.Rectangle;
+import com.badlogic.gdx.math.Circle;
 import com.badlogic.gdx.utils.Array;
 
 public class TiltMazeGame extends ApplicationAdapter {
-    enum GameState { START, PLAY, GAME_OVER, GOAL }
 
-    private OrthographicCamera cam;
+    // ------------------------------
+    // 1) ESTADOS DEL JUEGO
+    // ------------------------------
+    private enum GameState {
+        START,
+        PLAY,
+        WIN,
+        GAME_OVER
+    }
+
+    private GameState state = GameState.START;
+
+    // ------------------------------
+    // 2) MUNDO / CÁMARA (VERTICAL)
+    // ------------------------------
+    private static final float WORLD_WIDTH  = 480f;
+    private static final float WORLD_HEIGHT = 800f;
+
+    private OrthographicCamera camera;
     private ShapeRenderer shapes;
     private SpriteBatch batch;
     private BitmapFont font;
 
-    private final float WORLD_W = 800f;
-    private final float WORLD_H = 480f;
+    // ------------------------------
+    // 3) CONSTANTES MODIFICABLES (PARA LOS ALUMNOS)
+    // ------------------------------
+    // Cantidad de monedas necesarias para ganar
+    private static final int TARGET_COINS = 15;
 
-    // Jugador
-    private Circle ball;
-    private float vx = 0f, vy = 0f;
+    // Color del personaje (pueden cambiarlo)
+    private Color playerColor = Color.SKY;
 
-    // Control por tilt
-    private static final float G = 9.81f;          // m/s^2
-    private float zeroX = 0f, zeroY = 0f;          // calibración (offset)
-    private float filtX = 0f, filtY = 0f;          // filtrado LPF
-    private final float lpfAlpha = 0.18f;          // 0..1 (más alto = menos filtro)
-    private final float deadZone = 0.05f;          // zona muerta en "g"
-    private float sensitivity = 1500f;             // ganancia movimiento
-    private float damping = 0.90f;                 // frenado simple
+    // Física vertical
+    private static final float GRAVITY       = -900f;
+    private static final float JUMP_VELOCITY = 550f;
+    private static final float MAX_H_SPEED   = 220f;
 
-    // Nivel
-    private Array<Rectangle> walls;
-    private Rectangle goal;
+    // Giroscopio: qué tan fuerte se traduce la rotación a movimiento
+    private static final float GYRO_SENSITIVITY = 8.5f;
 
-    private GameState state = GameState.START;
-    private float playTime = 0f;
+    // Parámetros de plataformas (endless)
+    private static final float PLATFORM_WIDTH      = 120f;
+    private static final float PLATFORM_HEIGHT     = 18f;
+    private static final float PLATFORM_STEP_Y     = 120f;
+    // Probabilidad de que una plataforma tenga moneda (0.4 = 40%)
+    private static final float COIN_SPAWN_CHANCE   = 0.40f;
+
+    // ------------------------------
+    // 4) JUGADOR
+    // ------------------------------
+    private Rectangle player;
+    private float playerVy;
+
+    // ------------------------------
+    // 5) PLATAFORMAS Y MONEDAS
+    // ------------------------------
+    private Array<Rectangle> platforms;
+    private Array<Circle> coins;
+
+    private int coinsCollected = 0;
+
+    // Altura Y donde se colocará la siguiente plataforma nueva
+    private float nextPlatformY = 0f;
+
+    // ------------------------------
+    // 6) CONTROL CON GIROSCOPIO
+    // ------------------------------
+    // "Ángulo virtual" que usamos como inclinación izquierda/derecha.
+    private float virtualTiltX = 0f;
 
     @Override
     public void create() {
-        cam = new OrthographicCamera(WORLD_W, WORLD_H);
-        cam.position.set(WORLD_W / 2f, WORLD_H / 2f, 0);
-        cam.update();
+        camera = new OrthographicCamera(WORLD_WIDTH, WORLD_HEIGHT);
+        camera.position.set(WORLD_WIDTH / 2f, WORLD_HEIGHT / 2f, 0);
+        camera.update();
 
         shapes = new ShapeRenderer();
-        batch  = new SpriteBatch();
-        font   = new BitmapFont();
+        batch = new SpriteBatch();
+        font = new BitmapFont();
 
-        ball = new Circle(80, WORLD_H / 2f, 14);
+        platforms = new Array<>();
+        coins = new Array<>();
 
-        walls = new Array<>();
-        // Bordes
-        walls.add(new Rectangle(0, 0, WORLD_W, 20));
-        walls.add(new Rectangle(0, WORLD_H - 20, WORLD_W, 20));
-        walls.add(new Rectangle(0, 0, 20, WORLD_H));
-        walls.add(new Rectangle(WORLD_W - 20, 0, 20, WORLD_H));
-        // Obstáculos internos
-        walls.add(new Rectangle(150, 100, 500, 20));
-        walls.add(new Rectangle(150, 360, 500, 20));
-        walls.add(new Rectangle(150, 120, 20, 240));
-        walls.add(new Rectangle(630, 120, 20, 240));
-        // Pasillo hacia meta
-        walls.add(new Rectangle(700, 120, 20, 80));
-        walls.add(new Rectangle(700, 260, 20, 100));
+        // Solo informativo: ver si el dispositivo tiene giroscopio
+        boolean hasGyro = Gdx.input.isPeripheralAvailable(Input.Peripheral.Gyroscope);
+        Gdx.app.log("TiltJump", "Gyroscope available: " + hasGyro);
 
-        // Meta (verde)
-        goal = new Rectangle(WORLD_W - 100, WORLD_H / 2f - 40, 60, 80);
-
-        // Log de disponibilidad
-        Gdx.app.log("TiltMaze", "Accelerometer available: "
-            + Gdx.input.isPeripheralAvailable(Input.Peripheral.Accelerometer));
-
-        // Calibra “cero” con el teléfono como está al iniciar
-        calibrateZero();
+        initLevel();
     }
 
-    /** Lee acelerómetro, mapea según rotación y devuelve tilt normalizado en g. */
-    private void readTiltG(float[] out2) {
-        // Lecturas crudas (m/s^2), incluyen gravedad
-        float ax = Gdx.input.getAccelerometerX();
-        float ay = Gdx.input.getAccelerometerY();
-        float az = Gdx.input.getAccelerometerZ(); // no lo usamos, pero podría servir
+    /**
+     * Crea las plataformas iniciales, algunas monedas y resetea al jugador.
+     */
+    private void initLevel() {
+        platforms.clear();
+        coins.clear();
+        coinsCollected = 0;
+        virtualTiltX = 0f;
 
-        // Mapeo de ejes según rotación de pantalla
-        // Ajustado para que inclinar a la DERECHA mueva a la derecha (tx positivo)
-        // y inclinar ARRIBA empuje hacia arriba (ty positivo).
-        int rot = Gdx.input.getRotation(); // 0, 90, 180, 270
-        float tx, ty;
-        switch (rot) {
-            case 0:     // Portrait natural
-                tx = -ax;  // derecha -> tx+
-                ty =  ay;  // arriba   -> ty+
-                break;
-            case 90:    // Landscape, lado "derecho" arriba
-                tx =  ay;  // derecha -> tx+
-                ty =  ax;  // arriba   -> ty+
-                break;
-            case 180:   // Portrait invertido
-                tx =  ax;  // derecha -> tx+
-                ty = -ay;  // arriba   -> ty+
-                break;
-            case 270:   // Landscape, lado "izquierdo" arriba
-                tx = -ay;  // derecha -> tx+
-                ty = -ax;  // arriba   -> ty+
-                break;
-            default:
-                tx = -ax;
-                ty =  ay;
+        // Plataforma base
+        Rectangle ground = new Rectangle(0, 80, WORLD_WIDTH, 20);
+        platforms.add(ground);
+
+        // La siguiente plataforma se generará más arriba
+        nextPlatformY = 140f;
+
+        // Generamos un "colchón" de plataformas por encima de la cámara inicial
+        float targetFirstPlatformsY = WORLD_HEIGHT * 2f;
+        while (nextPlatformY < targetFirstPlatformsY) {
+            createPlatformWithOptionalCoin(nextPlatformY);
+            nextPlatformY += PLATFORM_STEP_Y;
         }
 
-        // Compensa offset de calibración
-        tx -= zeroX;
-        ty -= zeroY;
+        // Jugador sobre la base
+        player = new Rectangle(
+            ground.x + ground.width / 2f - 16f,
+            ground.y + ground.height,
+            32f,
+            32f
+        );
 
-        // Normaliza a múltiplos de "g"
-        tx /= G;
-        ty /= G;
+        playerVy = JUMP_VELOCITY;
+        state = GameState.START;
 
-        // Zona muerta: ignora inclinaciones muy pequeñas
-        if (Math.abs(tx) < deadZone) tx = 0f;
-        if (Math.abs(ty) < deadZone) ty = 0f;
-
-        // Filtro paso-bajo (suaviza)
-        filtX += lpfAlpha * (tx - filtX);
-        filtY += lpfAlpha * (ty - filtY);
-
-        out2[0] = filtX;
-        out2[1] = filtY;
-    }
-
-    /** Guarda el estado actual como “cero” (útil si el usuario sostiene el teléfono inclinado). */
-    private void calibrateZero() {
-        float ax = Gdx.input.getAccelerometerX();
-        float ay = Gdx.input.getAccelerometerY();
-        int rot = Gdx.input.getRotation();
-        // usa el mismo mapeo que readTiltG() pero sin normalizar/filtrar
-        switch (rot) {
-            case 0:  zeroX = -ax; zeroY =  ay; break;
-            case 90: zeroX =  ay; zeroY =  ax; break;
-            case 180:zeroX =  ax; zeroY = -ay; break;
-            case 270:zeroX = -ay; zeroY = -ax; break;
-            default: zeroX = -ax; zeroY =  ay; break;
-        }
-        // reinicia filtro para que no “arrastre” valores viejos
-        filtX = 0f;
-        filtY = 0f;
+        camera.position.set(WORLD_WIDTH / 2f, WORLD_HEIGHT / 2f, 0);
+        camera.update();
     }
 
     @Override
@@ -163,138 +152,309 @@ public class TiltMazeGame extends ApplicationAdapter {
         Gdx.gl.glClearColor(0.06f, 0.08f, 0.12f, 1f);
         Gdx.gl.glClear(GL20.GL_COLOR_BUFFER_BIT);
 
-        // Escena
-        shapes.setProjectionMatrix(cam.combined);
+        shapes.setProjectionMatrix(camera.combined);
+        batch.setProjectionMatrix(camera.combined);
+
+        // ------------------------------
+        // DIBUJO DE ESCENA
+        // ------------------------------
         shapes.begin(ShapeRenderer.ShapeType.Filled);
 
-        // Paredes
-        shapes.setColor(new Color(0.15f, 0.18f, 0.24f, 1f));
-        for (Rectangle r : walls) shapes.rect(r.x, r.y, r.width, r.height);
+        // Fondo
+        shapes.setColor(new Color(0.1f, 0.1f, 0.18f, 1f));
+        shapes.rect(
+            camera.position.x - WORLD_WIDTH / 2f,
+            camera.position.y - WORLD_HEIGHT / 2f,
+            WORLD_WIDTH,
+            WORLD_HEIGHT
+        );
 
-        // Meta
-        shapes.setColor(state == GameState.GOAL ? Color.GOLD : Color.GREEN);
-        shapes.rect(goal.x, goal.y, goal.width, goal.height);
+        // Plataformas
+        shapes.setColor(new Color(0.25f, 0.25f, 0.35f, 1f));
+        for (Rectangle p : platforms) {
+            shapes.rect(p.x, p.y, p.width, p.height);
+        }
 
-        // Bola
-        shapes.setColor(state == GameState.GAME_OVER ? Color.RED : Color.CYAN);
-        shapes.circle(ball.x, ball.y, ball.radius, 24);
+        // Monedas
+        shapes.setColor(Color.GOLD);
+        for (Circle c : coins) {
+            if (c.radius > 0f) {
+                shapes.circle(c.x, c.y, c.radius, 20);
+            }
+        }
+
+        // Jugador
+        shapes.setColor(playerColor);
+        shapes.rect(player.x, player.y, player.width, player.height);
 
         shapes.end();
 
-        // HUD
-        batch.setProjectionMatrix(cam.combined);
+        // ------------------------------
+        // DIBUJO DE HUD
+        // ------------------------------
         batch.begin();
         font.setColor(Color.WHITE);
+
+        font.draw(batch,
+            "Monedas: " + coinsCollected + " / " + TARGET_COINS,
+            camera.position.x - WORLD_WIDTH / 2f + 20,
+            camera.position.y + WORLD_HEIGHT / 2f - 20
+        );
+
+        font.draw(batch,
+            "Control: Giroscopio",
+            camera.position.x - WORLD_WIDTH / 2f + 20,
+            camera.position.y + WORLD_HEIGHT / 2f - 50
+        );
+
         switch (state) {
             case START:
-                font.draw(batch, "TILT MAZE", WORLD_W * 0.43f, WORLD_H * 0.62f);
-                font.draw(batch, "Inclina el celular para mover la bola", WORLD_W * 0.30f, WORLD_H * 0.52f);
-                font.draw(batch, "Toca para comenzar (mantén la postura para calibrar)", WORLD_W * 0.20f, WORLD_H * 0.45f);
+                font.draw(batch,
+                    "DOODLE JUMP SENSOR",
+                    camera.position.x - 90,
+                    camera.position.y + 40
+                );
+                font.draw(batch,
+                    "Inclina/gira el celular para moverte",
+                    camera.position.x - 150,
+                    camera.position.y + 10
+                );
+                font.draw(batch,
+                    "Recoge " + TARGET_COINS + " monedas para ganar",
+                    camera.position.x - 150,
+                    camera.position.y - 20
+                );
+                font.draw(batch,
+                    "Toca la pantalla para empezar",
+                    camera.position.x - 150,
+                    camera.position.y - 50
+                );
                 break;
-            case PLAY:
-                font.draw(batch, String.format("Tiempo: %.1f s", playTime), 26, WORLD_H - 26);
-                font.draw(batch, "Toca con dos dedos para recalibrar", WORLD_W - 310, 26);
+            case WIN:
+                font.draw(batch,
+                    "¡GANASTE! :D",
+                    camera.position.x - 70,
+                    camera.position.y + 20
+                );
+                font.draw(batch,
+                    "Toca para reiniciar",
+                    camera.position.x - 90,
+                    camera.position.y - 10
+                );
                 break;
             case GAME_OVER:
-                font.draw(batch, "GAME OVER", WORLD_W * 0.43f, WORLD_H * 0.58f);
-                font.draw(batch, "Toca para reiniciar", WORLD_W * 0.40f, WORLD_H * 0.50f);
+                font.draw(batch,
+                    "GAME OVER :(",
+                    camera.position.x - 80,
+                    camera.position.y + 20
+                );
+                font.draw(batch,
+                    "Toca para reiniciar",
+                    camera.position.x - 90,
+                    camera.position.y - 10
+                );
                 break;
-            case GOAL:
-                font.draw(batch, String.format("¡Ganaste! Tiempo: %.1f s", playTime), WORLD_W * 0.36f, WORLD_H * 0.58f);
-                font.draw(batch, "Toca para reiniciar", WORLD_W * 0.40f, WORLD_H * 0.50f);
+            case PLAY:
+                // Sin mensaje extra
                 break;
         }
+
         batch.end();
     }
 
     private void update(float dt) {
-        // Atajos: back para salir en desktop, etc. (no crítico en Android)
-        if (Gdx.input.isKeyJustPressed(Input.Keys.ESCAPE)) Gdx.app.exit();
+        // ESC para salir en desktop
+        if (Gdx.input.isKeyJustPressed(Input.Keys.ESCAPE)) {
+            Gdx.app.exit();
+        }
 
         if (state == GameState.START) {
             if (Gdx.input.justTouched()) {
-                // Al tocar en START, toma esa postura como “cero”
-                calibrateZero();
-                resetGame();
                 state = GameState.PLAY;
             }
             return;
         }
 
-        if (state == GameState.GAME_OVER || state == GameState.GOAL) {
+        if (state == GameState.WIN || state == GameState.GAME_OVER) {
             if (Gdx.input.justTouched()) {
-                resetGame();
-                state = GameState.START;
+                initLevel();
             }
             return;
         }
 
-        // PLAY
-        playTime += dt;
+        // Si estamos jugando:
+        updatePlayer(dt);
+        updateCamera();
+        generateMorePlatformsIfNeeded();
+        cleanupObjectsBelowCamera();
+        checkCoinsCollected();
+        checkWinOrFall();
+    }
 
-        // Recalibrar en cualquier momento con “multi-touch simple” (2 toques simultáneos)
-        if (Gdx.input.isTouched(0) && Gdx.input.isTouched(1)) {
-            calibrateZero();
+    /**
+     * Actualiza movimiento del jugador (horizontal por giroscopio + salto).
+     */
+    private void updatePlayer(float dt) {
+        // 1) Movimiento horizontal a partir del giroscopio
+        float inputX = readHorizontalFromGyro(dt); // entre -1 y 1
+        float vx = inputX * MAX_H_SPEED;
+
+        player.x += vx * dt;
+
+        // Wrap lateral
+        if (player.x + player.width < 0) {
+            player.x = WORLD_WIDTH;
+        } else if (player.x > WORLD_WIDTH) {
+            player.x = -player.width;
         }
 
-        // Lee tilt normalizado (en g) con mapeo por rotación, offset y filtro
-        float[] tilt = new float[2];
-        readTiltG(tilt);
-        float tiltX = MathUtils.clamp(tilt[0], -1f, 1f);
-        float tiltY = MathUtils.clamp(tilt[1], -1f, 1f);
+        // 2) Física vertical
+        playerVy += GRAVITY * dt;
 
-        // Aceleración -> velocidad (ganancia)
-        vx += tiltX * sensitivity * dt;
-        vy += tiltY * sensitivity * dt;
+        float oldY = player.y;
+        player.y += playerVy * dt;
 
-        // Frenado
-        vx *= damping;
-        vy *= damping;
+        // Rebote solo al caer
+        if (playerVy <= 0f) {
+            for (Rectangle p : platforms) {
+                boolean wasAbove = oldY >= p.y + p.height;
+                boolean nowBelowTop = player.y <= p.y + p.height;
+                boolean withinX =
+                    player.x + player.width * 0.5f > p.x &&
+                        player.x + player.width * 0.5f < p.x + p.width;
 
-        // Integración y colisiones separadas
-        float nextX = ball.x + vx * dt;
-        float nextY = ball.y + vy * dt;
-
-        float prevX = ball.x;
-        ball.x = MathUtils.clamp(nextX, ball.radius, WORLD_W - ball.radius);
-        if (collidesAny(ball)) { ball.x = prevX; vx = 0; }
-
-        float prevY = ball.y;
-        ball.y = MathUtils.clamp(nextY, ball.radius, WORLD_H - ball.radius);
-        if (collidesAny(ball)) { ball.y = prevY; vy = 0; }
-
-        // Derrota por tocar bordes (opcional)
-        if (touchesBorder(ball)) state = GameState.GAME_OVER;
-
-        // Victoria
-        if (ball.x + ball.radius > goal.x && ball.x - ball.radius < goal.x + goal.width &&
-            ball.y + ball.radius > goal.y && ball.y - ball.radius < goal.y + goal.height) {
-            state = GameState.GOAL;
+                if (wasAbove && nowBelowTop && withinX) {
+                    player.y = p.y + p.height;
+                    playerVy = JUMP_VELOCITY;
+                    break;
+                }
+            }
         }
     }
 
-    private boolean collidesAny(Circle c) {
-        for (Rectangle r : walls) if (circleIntersectsRect(c, r)) return true;
-        return false;
+    /**
+     * Lee el giroscopio y lo convierte en un "ángulo virtual" entre -1 y 1.
+     * Cuanto más gires el teléfono, más se mueve el personaje.
+     */
+    private float readHorizontalFromGyro(float dt) {
+        // Rotación alrededor del eje Z (como girar un volante)
+        float gyroZ = Gdx.input.getGyroscopeZ(); // radianes/segundo
+
+        // Integramos para acumular una inclinación virtual
+        virtualTiltX += -gyroZ * dt * GYRO_SENSITIVITY;
+
+        // Permitimos más inclinación acumulada
+        virtualTiltX = MathUtils.clamp(virtualTiltX, -3f, 3f);
+
+        // Pequeño decaimiento para que vuelva poco a poco al centro
+        virtualTiltX *= 0.99f;
+
+        // Valor final que usamos: entre -1 y 1
+        return MathUtils.clamp(virtualTiltX, -1f, 1f);
     }
 
-    private boolean circleIntersectsRect(Circle c, Rectangle r) {
-        float closestX = MathUtils.clamp(c.x, r.x, r.x + r.width);
-        float closestY = MathUtils.clamp(c.y, r.y, r.y + r.height);
-        float dx = c.x - closestX;
-        float dy = c.y - closestY;
-        return (dx * dx + dy * dy) <= (c.radius * c.radius);
+    /**
+     * La cámara sigue al jugador hacia arriba.
+     */
+    private void updateCamera() {
+        if (player.y > camera.position.y) {
+            camera.position.y = player.y;
+        }
+        camera.update();
     }
 
-    private boolean touchesBorder(Circle c) {
-        return c.x - c.radius <= 20 || c.x + c.radius >= WORLD_W - 20 ||
-            c.y - c.radius <= 20 || c.y + c.radius >= WORLD_H - 20;
+    /**
+     * Crea una plataforma en la altura indicada y, con cierta probabilidad,
+     * una moneda sobre ella.
+     */
+    private void createPlatformWithOptionalCoin(float y) {
+        float x = MathUtils.random(20f, WORLD_WIDTH - PLATFORM_WIDTH - 20f);
+        Rectangle p = new Rectangle(x, y, PLATFORM_WIDTH, PLATFORM_HEIGHT);
+        platforms.add(p);
+
+        // ¿Esta plataforma tendrá moneda?
+        if (MathUtils.random() < COIN_SPAWN_CHANCE) {
+            float cx = p.x + p.width / 2f;
+            float cy = p.y + p.height + 26f;
+            Circle coin = new Circle(cx, cy, 10f);
+            coins.add(coin);
+        }
     }
 
-    private void resetGame() {
-        ball.set(80, WORLD_H / 2f, 14);
-        vx = vy = 0f;
-        playTime = 0f;
+    /**
+     * Genera más plataformas (y posibles monedas) por encima de la cámara,
+     * para que el nivel sea "infinito" hacia arriba.
+     */
+    private void generateMorePlatformsIfNeeded() {
+        // Queremos tener plataformas hasta 1 pantalla por encima de la cámara
+        float targetY = camera.position.y + WORLD_HEIGHT;
+
+        while (nextPlatformY < targetY) {
+            createPlatformWithOptionalCoin(nextPlatformY);
+            nextPlatformY += PLATFORM_STEP_Y;
+        }
+    }
+
+    /**
+     * Elimina plataformas y monedas que quedaron muy por debajo de la cámara
+     * (ya no se verán y no se necesitan).
+     */
+    private void cleanupObjectsBelowCamera() {
+        float removeBelowY = camera.position.y - WORLD_HEIGHT * 2f;
+
+        // Plataformas
+        for (int i = platforms.size - 1; i >= 0; i--) {
+            Rectangle p = platforms.get(i);
+            if (p.y + p.height < removeBelowY) {
+                platforms.removeIndex(i);
+            }
+        }
+
+        // Monedas
+        for (int i = coins.size - 1; i >= 0; i--) {
+            Circle c = coins.get(i);
+            if (c.radius <= 0f || c.y + c.radius < removeBelowY) {
+                coins.removeIndex(i);
+            }
+        }
+    }
+
+    /**
+     * Verifica colisión con monedas.
+     */
+    private void checkCoinsCollected() {
+        float playerCenterX = player.x + player.width / 2f;
+        float playerCenterY = player.y + player.height / 2f;
+        float playerRadius = player.width * 0.5f;
+
+        for (Circle c : coins) {
+            if (c.radius <= 0f) continue;
+
+            float dx = playerCenterX - c.x;
+            float dy = playerCenterY - c.y;
+            float dist2 = dx * dx + dy * dy;
+            float sumR = playerRadius + c.radius;
+
+            if (dist2 <= sumR * sumR) {
+                c.radius = 0f;
+                coinsCollected++;
+            }
+        }
+    }
+
+    /**
+     * Comprueba si ganó o si se cayó demasiado.
+     */
+    private void checkWinOrFall() {
+        if (coinsCollected >= TARGET_COINS) {
+            state = GameState.WIN;
+            return;
+        }
+
+        float bottomLimit = camera.position.y - WORLD_HEIGHT / 2f - 150f;
+        if (player.y + player.height < bottomLimit) {
+            state = GameState.GAME_OVER;
+        }
     }
 
     @Override
